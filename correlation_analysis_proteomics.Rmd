@@ -1,0 +1,309 @@
+---
+title: "Correlation analysis TBX21"
+subtitle: ""
+author:
+    - Thomas Naake^[European Molecular Biology Laboratory, Meyerhofstrasse 1, 69117 Heidelberg, Germany]
+fig_width: 15
+fig_height: 10
+fontsize: 12pt
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: TRUE
+    theme: united
+    number_sections: true
+    highlight: tango
+---
+
+```{r env, include=FALSE, echo=FALSE, cache=FALSE}
+library("knitr")
+library("ggplot2")
+library("tidyverse")
+knitr::opts_chunk$set(stop_on_error = 1L, fig.pos = "ht", dev = "png")
+suppressPackageStartupMessages(library("pathview"))
+suppressPackageStartupMessages(library("MatrixQCvis"))
+suppressPackageStartupMessages(library("multiGSEA"))
+suppressPackageStartupMessages(library("ggplot2"))
+suppressPackageStartupMessages(library("limma"))
+```
+
+Load the data set from Herbst et al. (2021).
+
+```{r warning=FALSE, message=FALSE}
+load("multiomics_MAE.RData")
+prot <- multiomics_MAE[["proteomics"]]
+dim(prot)
+vsn::meanSdPlot(prot)
+```
+
+# Correlation analysis
+
+Run the correlation analysis:
+
+ - Pearson correlation and
+ - Spearman correlation.
+ 
+Only calculate the values for correlation with `TBX21`.
+
+```{r, eval = TRUE, echo = TRUE}
+cor_pearson <- lapply(seq_len(nrow(prot)), function(i) {
+    psych::corr.test(x = prot["TBX21", ], y = prot[i, ], method = "pearson", 
+        adjust = "BH")
+})
+cor_spearman <- lapply(seq_len(nrow(prot)), function(i) {
+    psych::corr.test(x = prot["TBX21", ], y = prot[i, ], method = "spearman", 
+        adjust = "BH")
+})
+```
+
+```{r}
+## create vectors with coefficient values, p-values, adjusted p-values
+cor_pearson_coef <- unlist(lapply(cor_pearson, function(i) i[["r"]]))
+names(cor_pearson_coef) <- rownames(prot)
+cor_pearson_p <- unlist(lapply(cor_pearson, function(i) i[["p"]]))
+names(cor_pearson_p) <- rownames(prot)
+cor_pearson_padj <- unlist(lapply(cor_pearson, function(i) i[["p.adj"]]))
+names(cor_pearson_padj) <- rownames(prot)
+
+cor_spearman_coef <- unlist(lapply(cor_spearman, function(i) i[["r"]]))
+names(cor_spearman_coef) <- rownames(prot)
+cor_spearman_p <- unlist(lapply(cor_spearman, function(i) i[["p"]]))
+names(cor_spearman_p) <- rownames(prot)
+cor_spearman_padj <- unlist(lapply(cor_spearman, function(i) i[["p.adj"]]))
+names(cor_spearman_padj) <- rownames(prot)
+
+## bind to a data.frame
+df_corr <- data.frame(
+    protein = names(cor_pearson_coef),
+    pearson_coef = cor_pearson_coef,
+    pearson_p = cor_pearson_p,
+    pearson_padj = cor_pearson_padj,
+    spearman_coef = cor_spearman_coef,
+    spearman_p = cor_spearman_p,
+    spearman_padj = cor_spearman_padj 
+)
+
+## show the correlating features and write the values to a file
+rmarkdown::paged_table(df_corr[order(abs(df_corr$pearson_coef), decreasing=TRUE), ])
+write.table(df_corr, file = "correlation_coefficient_pvalue_TB21.txt",
+    sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Co-expression with RUNX3 and IRF9
+
+It was mentioned by Philipp, that there is a potential regulation towards
+RUNX3 and IRF9. What are the correlation coefficients with those?
+
+```{r echo=FALSE, eval=TRUE}
+rmarkdown::paged_table(df_corr[c("RUNX3", "IRF9"), ])
+```
+
+# Pathway analysis
+
+According to https://www.genome.jp/entry/hsa:30009, `TBX21` is located in
+the following pathway maps:
+
+ - `hsa04658`: Th1 and Th2 cell differentiation
+ - `hsa04659`: Th17 cell differentiation
+ - `hsa05321`: Inflammatory bowel disease
+
+Visualize these pathways together with their correlation coefficients.
+
+```{r message=FALSE, warning=FALSE}
+coef <- matrix(c(df_corr$pearson_coef, df_corr$spearman_coef), 
+    byrow = TRUE, nrow = 2)
+colnames(coef) <- df_corr$protein
+rownames(coef) <- c("pearson", "spearman")
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04658",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_pathway")
+
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04659",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_pathway")
+
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa05321",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_pathway")
+```
+
+# Pathway analysis of correlated proteins
+
+Do some hacking here and assign the Pearson correlation coefficients to 
+`proteome` slot and Spearman correlation coefficients to `transcriptome`
+slot to jointly analyze these two coefficients for the pathway analysis.
+
+```{r message=FALSE}
+set.seed(2022)
+databases <- c("kegg")
+layers <- c("proteome", "transcriptome")
+pathways <- getMultiOmicsFeatures(dbs = databases, layer = layers, 
+    returnProteome = "SYMBOL", useLocal = FALSE)
+
+## requires logFC, pValue, adj.pValue
+omics_data <- initOmicsDataStructure(layer = layers)
+
+## set the p-values that are small (0) to a small values
+df_corr$pearson_p <- ifelse(df_corr$pearson_p < 1e-60, 1e-60, df_corr$pearson_p)
+df_corr$spearman_p <- ifelse(df_corr$spearman_p < 1e-60, 1e-60, df_corr$pearson_p)
+
+## add 1st layer
+omics_data$proteome <- rankFeatures(logFC = df_corr$pearson_coef, 
+    pvalues = df_corr$pearson_p)
+names(omics_data$proteome) <- df_corr$protein
+
+## add 2nd layer
+omics_data$transcriptome <- rankFeatures(logFC = df_corr$spearman_coef, 
+    pvalues = df_corr$spearman_p)
+names(omics_data$transcriptome) <- df_corr$protein
+
+## Run the pathway enrichment
+# use the multiGSEA function to calculate the enrichment scores
+# for all omics layer at once.
+enrichment_scores <- multiGSEA(pathways, omics_data)
+
+## Calculate the aggregated p-values
+df <- extractPvalues(enrichmentScores = enrichment_scores,
+    pathwayNames = enrichment_scores$transcriptome$pathway)
+df <- data.frame(pathway = enrichment_scores$transcriptome$pathway, df)
+df$pathway <- factor(df$pathway, levels = df$pathway)
+df$ES_transcriptome <- enrichment_scores$transcriptome$ES
+df$NES_transcriptome <- enrichment_scores$transcriptome$NES
+df$ES_proteome <- enrichment_scores$proteome$ES
+df$NES_proteome <- enrichment_scores$proteome$NES
+df$combined_pval <- combinePvalues(df)
+df$combined_padj <- p.adjust(df$combined_pval, method = "BH")
+
+## filter the data.frame and order
+df_cut <- df[!is.na(df[, "proteome_padj"]) & !is.na(df[, "transcriptome_padj"]), ]
+df_cut <- df_cut[order(df_cut[, "combined_pval"]), ]
+df_cut$log10combp <- -log10(df_cut$combined_pval)
+df_cut$pathway <- factor(df_cut$pathway, levels = df_cut$pathway)
+
+rmarkdown::paged_table(df_cut)
+
+## write the object to a file
+write.table(df_cut, file = "correlation_TBX21_multiGSEA_pathways.txt",
+    dec = ".", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+## print the top 10 pathways with lowest combined p value
+ggplot(df_cut[1:10,], aes(x = pathway, y = log10combp)) + 
+  geom_bar(stat = "identity") + coord_flip() + ylab("-log10(p-value)")
+
+## pathway visualization
+coef <- matrix(c(df_corr$pearson_coef, df_corr$spearman_coef), 
+    byrow = TRUE, nrow = 2)
+colnames(coef) <- df_corr$protein
+rownames(coef) <- c("pearson", "spearman")
+
+## Th1 and Th2 cell differentiation - hsa04658
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04658",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## Inflammatory bowel disease - hsa05321
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa05321",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## Phosphatidylinositol signaling system - hsa04070
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04070",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## C-type lectin receptor signaling pathway - hsa04625
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04625",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## Th17 cell differentiation - hsa04659
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04659",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## TNF signaling pathway - hsa04668
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04668",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## Prolactin signaling pathway - hsa04917
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa04917",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## "Amyotrophic lateral sclerosis" - hsa05014
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa05014",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## Pathways of neurodegeneration - multiple diseases - hsa05022
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa05022",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+
+## "Coronavirus disease - COVID-19" - hsa05171
+pathview(gene.data = t(coef), gene.idtype = "symbol", pathway.id = "hsa05171",
+    same.layer = TRUE, species = "hsa", out.suffix = "TBX_correlated")
+``` 
+
+
+
+# Differential expression 
+
+Split the data set up in 0-25%-quantile group and 75-100% quantile group 
+and perform differential abundance analysis between these two groups.
+
+```{r}
+qu <- quantile(prot["TBX21", ])
+qu_025 <- prot["TBX21", ] < qu["25%"]
+qu_2550 <- prot["TBX21", ] >= qu["25%"] & prot["TBX21", ] < qu["75%"]
+qu_75100 <- prot["TBX21", ] >= qu["75%"]
+
+tbx21_groups <- character(length(prot["TBX21", ]))
+tbx21_groups <- ifelse(qu_025, "lower", tbx21_groups)
+tbx21_groups <- ifelse(qu_2550, "middle", tbx21_groups)
+tbx21_groups <- ifelse(qu_75100, "upper", tbx21_groups)
+
+## how does this grouping agree with ASB-CLL?
+pg <- read.table("PGs.txt", sep = "\t", header = TRUE)
+pg$PG_ASB_CLL <- ifelse(pg$PG == "ASB-CLL", "ASB-CLL", "other")
+all(names(tbx21_groups) == pg$patient_ID_CLL)
+table(tbx21_groups, pg$PG)
+table(tbx21_groups, pg$PG_ASB_CLL)
+```
+
+Perform now the differential abundance analysis between `qu_025` group and 
+`qu_75100` group. The ratios were previously `log2` transformed - transform
+them by taking `2^(log2(ratio))`.
+
+```{r, message=FALSE, warning=FALSE}
+all(colnames(prot) == pg$patient_ID_CLL)
+cD <- data.frame(sample = colnames(prot), qu = as.character(tbx21_groups))
+design <- model.matrix(~ 0 + qu, data = cD)
+colnames(design) <- make.names(colnames(design))
+fit <- lmFit(object = 2^prot, design = design, method = "ls")
+
+## create contrasts
+contrasts <- makeContrasts(
+    lower_vs_upper = qulower - quupper,
+    levels = design)
+fit_c <- contrasts.fit(fit, contrasts)
+fit_eB <- eBayes(fit_c)
+
+## set parameters for differential expression
+num <- Inf
+p_val <- 1
+adj <- "BH"
+```
+
+Return the log FC and p-values for differentially abundant proteins.
+```{r de_qu_groups, message=FALSE, warning=FALSE}
+tT <- topTable(fit_eB, number = num, p.value = p_val, adjust.method = adj,
+    coef = "lower_vs_upper")
+rmarkdown::paged_table(tT)
+
+## show for RUNX3 and IRF9
+rmarkdown::paged_table(tT[c("RUNX3", "IRF9"), ])
+```
+
+```{r de_qu_groups_volcan0, eval=TRUE, echo=FALSE}
+tT <- cbind(name = rownames(tT), tT)
+partial_bundle(volcanoPlot(tT))
+```
+
+# Package version
+
+Print here the package versions used in this analysis.
+
+```{r}
+sessionInfo()
+```
